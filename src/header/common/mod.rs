@@ -56,6 +56,7 @@ pub use self::transfer_encoding::TransferEncoding;
 pub use self::upgrade::{Upgrade, Protocol, ProtocolName};
 pub use self::user_agent::UserAgent;
 pub use self::vary::Vary;
+pub use self::www_authenticate::WWWAuthenticate;
 
 #[doc(hidden)]
 #[macro_export]
@@ -415,3 +416,4 @@ mod transfer_encoding;
 mod upgrade;
 mod user_agent;
 mod vary;
+mod www_authenticate;
