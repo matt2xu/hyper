@@ -3,6 +3,7 @@
 // "Hypertext Transfer Protocol (HTTP/1.1): Authentication" https://www.ietf.org/rfc/rfc7235.txt
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::iter::{Enumerate, Peekable};
@@ -60,7 +61,7 @@ impl<S: Scheme + Any> Header for WwwAuthenticate<S> {
 
 struct Challenge<'a> {
     scheme: &'a str,
-    params: Vec<(&'a str, &'a str)>
+    params: Vec<(Cow<'a, str>, Cow<'a, str>)>
 }
 
 impl<'a> Challenge<'a> {
@@ -68,7 +69,7 @@ impl<'a> Challenge<'a> {
         self.scheme
     }
 
-    fn params(&self) -> &[(&'a str, &'a str)] {
+    fn params(&self) -> &[(Cow<'a, str>, Cow<'a, str>)] {
         &self.params
     }
 }
@@ -76,7 +77,7 @@ impl<'a> Challenge<'a> {
 #[derive(Eq, PartialEq)]
 enum Token<'a> {
     Ident(&'a str),
-    String(&'a str),
+    String(Cow<'a, str>),
     Comma,
     Equal
 }
@@ -93,6 +94,44 @@ impl<'a> TokenIter<'a> {
             iter: text.bytes().enumerate().peekable()
         }
     }
+
+    fn slice(&mut self, begin: usize, end: usize) -> &'a str {
+        unsafe {self.text.slice_unchecked(begin + 1, end)}
+    }
+
+    fn next_string(&mut self, begin: usize) -> Option<Token<'a>> {
+        while let Some((end, ch)) = self.iter.next() {
+            match ch {
+                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin, end)))),
+                b'\\' => return self.next_string_owned(begin, end),
+                _ => ()
+            }
+        }
+
+        // malformed string
+        None
+    }
+
+    /// owned version of next_string, used when the quoted-string contains a quoted-pair
+    fn next_string_owned(&mut self, begin: usize, end: usize) -> Option<Token<'a>> {
+        let mut string = self.slice(begin, end).to_owned();
+        while let Some((_end, ch)) = self.iter.next() {
+            match ch {
+                b'"' => return Some(Token::String(Cow::Owned(string))),
+                b'\\' => {
+                    if let Some((_, ch)) = self.iter.next() {
+                        string.push(ch as char);
+                    } else {
+                        break;
+                    }
+                }
+                _ => string.push(ch as char)
+            }
+        }
+
+        // malformed string
+        None
+    }
 }
 
 impl<'a> Iterator for TokenIter<'a> {
@@ -103,17 +142,7 @@ impl<'a> Iterator for TokenIter<'a> {
                 b'=' => return Some(Token::Equal),
                 b',' => return Some(Token::Comma),
                 b' ' | b'\t' => continue,
-                b'"' => {
-                    while let Some((end, ch)) = self.iter.next() {
-                        if ch == b'"' {
-                            let slice = unsafe {self.text.slice_unchecked(begin + 1, end)};
-                            return Some(Token::String(slice));
-                        }
-                    }
-
-                    // malformed string
-                    return None;
-                }
+                b'"' => return self.next_string(begin),
                 _ => {
                     // use peek so we don't eat the last character of the token
                     while let Some(&(end, ch)) = self.iter.peek() {
@@ -161,20 +190,30 @@ impl<'a> ChallengeIter<'a> {
         }
     }
 
-    fn add_params(&mut self, params: &mut Vec<(&'a str, &'a str)>, mut key: &'a str) -> ::Result<()> {
+    fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>, ident: &'a str) -> ::Result<()> {
         let mut state = 1;
+        let mut key = Some(Cow::Borrowed(ident));
         while let Some(token) = self.tokens.next() {
             match token {
                 Token::Equal => {
                     state = 1;
                     self.tokens.next().unwrap();
                 }
-                Token::Ident(ident) | Token::String(ident) => {
+                Token::Ident(ident) => {
                     if state == 1 {
-                        params.push((key, ident));
+                        params.push((key.take().unwrap(), Cow::Borrowed(ident)));
                         state = 0;
                     } else {
-                        key = ident;
+                        key = Some(Cow::Borrowed(ident));
+                        state = 1;
+                    }
+                }
+                Token::String(cow) => {
+                    if state == 1 {
+                        params.push((key.take().unwrap(), cow));
+                        state = 0;
+                    } else {
+                        key = Some(cow);
                         state = 1;
                     }
                 }
@@ -215,7 +254,7 @@ pub trait Scheme: fmt::Debug + Clone + Send + Sync {
     fn fmt_scheme(&self, &mut fmt::Formatter) -> fmt::Result;
 
     /// Creates a Scheme from a list of parameters.
-    fn from_params(params: &[(&str, &str)]) -> ::Result<Self>;
+    fn from_params<'a>(params: &[(Cow<'a, str>, Cow<'a, str>)]) -> ::Result<Self>;
 }
 
 /// Credential holder for Basic Authentication
@@ -237,7 +276,7 @@ impl Scheme for Basic {
         f.write_str("Basic")
     }
 
-    fn from_params(_params: &[(&str, &str)]) -> ::Result<Basic> {
+    fn from_params<'a>(_params: &[(Cow<'a, str>, Cow<'a, str>)]) -> ::Result<Basic> {
         let basic = Basic {
             username: "foo".to_string(),
             password: Some("bar".to_string())
