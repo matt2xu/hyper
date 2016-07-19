@@ -6,8 +6,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::iter::{Enumerate, Peekable};
-use std::str::Bytes;
+use std::iter::{Peekable};
 
 use header::{Header, parsing};
 
@@ -84,26 +83,74 @@ enum Token<'a> {
 
 struct TokenIter<'a> {
     text: &'a str,
-    iter: Peekable<Enumerate<Bytes<'a>>>
+    position: usize
 }
 
 impl<'a> TokenIter<'a> {
     fn new(text: &'a str) -> TokenIter<'a> {
         TokenIter {
             text: text,
-            iter: text.bytes().enumerate().peekable()
+            position: 0
+        }
+    }
+
+    fn next_char(&mut self) -> Option<(usize, u8)> {
+        let bytes = self.text.as_bytes();
+        if self.position < bytes.len() {
+            let result = Some((self.position, unsafe {*bytes.get_unchecked(self.position)}));
+            self.position += 1;
+            result
+        } else {
+            None
         }
     }
 
     fn slice(&mut self, begin: usize, end: usize) -> &'a str {
-        unsafe {self.text.slice_unchecked(begin + 1, end)}
+        unsafe {self.text.slice_unchecked(begin, end)}
+    }
+
+    fn next_ident(&mut self, begin: usize) -> Option<Token<'a>> {
+        let mut end = begin;
+        while let Some((index, ch)) = self.next_char() {
+            end = index;
+            match ch {
+                b'=' => {
+                    end = self.next_ident_or_token68(index);
+                    break;
+                }
+                b' ' | b'\t' | b',' | b'"' => break,
+                _ => ()
+            }
+        }
+
+        Some(Token::Ident(self.slice(begin, end)))
+    }
+
+    fn next_ident_or_token68(&mut self, first_equal_index: usize) -> usize {
+        let mut last_equal_index = first_equal_index;
+        while let Some((index, ch)) = self.next_char() {
+            match ch {
+                b'=' => {
+                    last_equal_index = index;
+                }
+                b' ' | b'\t' => (), // ignore whitespace
+                b',' => break, // token68
+                _ => {
+                    // beginning of a token or quoted string
+                    self.position = first_equal_index;
+                    return first_equal_index;
+                }
+            }
+        }
+
+        last_equal_index + 1
     }
 
     fn next_string(&mut self, begin: usize) -> Option<Token<'a>> {
-        while let Some((end, ch)) = self.iter.next() {
+        while let Some((end, ch)) = self.next_char() {
             match ch {
-                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin, end)))),
-                b'\\' => return self.next_string_owned(begin, end),
+                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin + 1, end)))),
+                b'\\' => return self.next_string_owned(begin + 1, end),
                 _ => ()
             }
         }
@@ -115,11 +162,11 @@ impl<'a> TokenIter<'a> {
     /// owned version of next_string, used when the quoted-string contains a quoted-pair
     fn next_string_owned(&mut self, begin: usize, end: usize) -> Option<Token<'a>> {
         let mut string = self.slice(begin, end).to_owned();
-        while let Some((_end, ch)) = self.iter.next() {
+        while let Some((_, ch)) = self.next_char() {
             match ch {
                 b'"' => return Some(Token::String(Cow::Owned(string))),
                 b'\\' => {
-                    if let Some((_, ch)) = self.iter.next() {
+                    if let Some((_, ch)) = self.next_char() {
                         string.push(ch as char);
                     } else {
                         break;
@@ -137,22 +184,13 @@ impl<'a> TokenIter<'a> {
 impl<'a> Iterator for TokenIter<'a> {
     type Item = Token<'a>;
     fn next(&mut self) -> Option<Token<'a>> {
-        while let Some((begin, ch)) = self.iter.next() {
+        while let Some((index, ch)) = self.next_char() {
             match ch {
                 b'=' => return Some(Token::Equal),
                 b',' => return Some(Token::Comma),
                 b' ' | b'\t' => continue,
-                b'"' => return self.next_string(begin),
-                _ => {
-                    // use peek so we don't eat the last character of the token
-                    while let Some(&(end, ch)) = self.iter.peek() {
-                        if ch == b' ' || ch == b'\t' || ch == b',' || ch == b'=' || ch == b'"' {
-                            let slice = unsafe {self.text.slice_unchecked(begin + 1, end)};
-                            return Some(Token::Ident(slice));
-                        }
-                        self.iter.next().unwrap();
-                    }
-                }
+                b'"' => return self.next_string(index),
+                _ => return self.next_ident(index)
             }
         }
         None
