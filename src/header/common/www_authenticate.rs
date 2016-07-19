@@ -73,7 +73,7 @@ impl<'a> Challenge<'a> {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum Token<'a> {
     Ident(&'a str),
     String(Cow<'a, str>),
@@ -112,14 +112,16 @@ impl<'a> TokenIter<'a> {
     fn next_ident(&mut self, begin: usize) -> Option<Token<'a>> {
         let mut end = begin;
         while let Some((index, ch)) = self.next_char() {
-            end = index;
             match ch {
                 b'=' => {
                     end = self.next_ident_or_token68(index);
                     break;
                 }
-                b' ' | b'\t' | b',' | b'"' => break,
-                _ => ()
+                b' ' | b'\t' | b',' | b'"' => {
+                    end = index;
+                    break;
+                }
+                _ => { end = index + 1; }
             }
         }
 
@@ -128,15 +130,26 @@ impl<'a> TokenIter<'a> {
 
     fn next_ident_or_token68(&mut self, first_equal_index: usize) -> usize {
         let mut last_equal_index = first_equal_index;
+        let mut whitespace = false;
         while let Some((index, ch)) = self.next_char() {
             match ch {
                 b'=' => {
+                    if whitespace {
+                        // syntax error, go back and leave
+                        self.position = last_equal_index + 1;
+                        break;
+                    }
                     last_equal_index = index;
                 }
-                b' ' | b'\t' => (), // ignore whitespace
-                b',' => break, // token68
-                _ => {
-                    // beginning of a token or quoted string
+                b' ' | b'\t' => {
+                    // to know that this is no longer a series of '='
+                    whitespace = true;
+                }
+                b',' => { // token68, go back to the comma
+                    self.position = index;
+                    break;
+                }
+                _ => { // beginning of a token or quoted string, go back to the first equal sign
                     self.position = first_equal_index;
                     return first_equal_index;
                 }
@@ -147,10 +160,20 @@ impl<'a> TokenIter<'a> {
     }
 
     fn next_string(&mut self, begin: usize) -> Option<Token<'a>> {
+        let begin = begin + 1;
         while let Some((end, ch)) = self.next_char() {
             match ch {
-                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin + 1, end)))),
-                b'\\' => return self.next_string_owned(begin + 1, end),
+                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin, end)))),
+                b'\\' => {
+                    let mut string = self.slice(begin, end).to_owned();
+                    if let Some((_, ch)) = self.next_char() {
+                        string.push(ch as char);
+                    } else {
+                        break;
+                    }
+
+                    return self.next_string_owned(string);
+                },
                 _ => ()
             }
         }
@@ -160,8 +183,7 @@ impl<'a> TokenIter<'a> {
     }
 
     /// owned version of next_string, used when the quoted-string contains a quoted-pair
-    fn next_string_owned(&mut self, begin: usize, end: usize) -> Option<Token<'a>> {
-        let mut string = self.slice(begin, end).to_owned();
+    fn next_string_owned(&mut self, mut string: String) -> Option<Token<'a>> {
         while let Some((_, ch)) = self.next_char() {
             match ch {
                 b'"' => return Some(Token::String(Cow::Owned(string))),
@@ -331,17 +353,48 @@ impl fmt::Display for WwwAuthenticate<Basic> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WwwAuthenticate};
+    use super::{WwwAuthenticate, Basic, TokenIter};
     use ::header::Header;
 
     #[test]
     fn test_parse_header() {
-        assert!(WwwAuthenticate::parse_header([b"".to_vec()].as_ref()).is_err());
+        // assert!(WwwAuthenticate::parse_header([b"".to_vec()].as_ref()).is_err());
+
+        for token in TokenIter::new("Basic x=,Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new("Basic x=  =,Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new("Basic x==,Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new("Basic x=    ,Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new("Basic x==   ,Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new("Basic x=    a  ,   Digest") {
+            println!("{:?}", token);
+        }
+
+        for token in TokenIter::new(r#"Basic x=    "a \"quoted\" pair",Digest"#) {
+            println!("{:?}", token);
+        }
 
         let a = [b"Basic".to_vec()];
-        let a: WwwAuthenticate = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
-        let b = WwwAuthenticate::Basic;
-        assert_eq!(a, b);
+        let a: WwwAuthenticate<Basic> = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
+        let b = Basic {
+            username: "login".to_string(),
+            password: Some("password".to_string())
+        };
+        assert_eq!(*a, b);
     }
 
     //
