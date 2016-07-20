@@ -9,6 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::iter::{Peekable};
 use std::str::Split;
 
+use serialize::base64::FromBase64;
 use header::{Header, parsing};
 
 /// The `WWW-Authenticate` header field.
@@ -41,7 +42,7 @@ impl<S: Scheme + Any> Header for WwwAuthenticate<S> {
                 let challenge = try!(challenge);
                 let scheme = <S as Scheme>::scheme();
                 if challenge.scheme() == scheme {
-                    return match S::from_params(challenge.params()).map(WwwAuthenticate) {
+                    return match S::from_info(challenge.info()).map(WwwAuthenticate) {
                         Ok(h) => Ok(h),
                         Err(_) => Err(::Error::Header)
                     };
@@ -60,24 +61,29 @@ impl<S: Scheme + Any> Header for WwwAuthenticate<S> {
 }
 
 struct Challenge<'a> {
-    scheme: &'a str,
-    params: Vec<(Cow<'a, str>, Cow<'a, str>)>
+    scheme: Cow<'a, str>,
+    info: Option<ChallengeInfo<'a>>
+}
+
+#[derive(Debug)]
+pub enum ChallengeInfo<'a> {
+    Base64(Cow<'a, str>),
+    Params(Vec<(Cow<'a, str>, Cow<'a, str>)>)
 }
 
 impl<'a> Challenge<'a> {
-    fn scheme(&self) -> &'a str {
-        self.scheme
+    fn scheme(&'a self) -> &'a str {
+        &self.scheme
     }
 
-    fn params(&self) -> &[(Cow<'a, str>, Cow<'a, str>)] {
-        &self.params
+    fn info(&self) -> Option<&ChallengeInfo<'a>> {
+        self.info.as_ref()
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum Token<'a> {
-    Ident(&'a str),
-    String(Cow<'a, str>),
+    Text(Cow<'a, str>),
     Equal
 }
 
@@ -118,14 +124,14 @@ impl<'a> TokenIter<'a> {
                     break;
                 }
                 b' ' | b'\t' | b'"' => {
-                    end = index;
+                    end = index - 1;
                     break;
                 }
-                _ => { end = index + 1; }
+                _ => { end = index; }
             }
         }
 
-        Some(Token::Ident(self.slice(begin, end)))
+        Some(Token::Text(Cow::Borrowed(self.slice(begin, end + 1))))
     }
 
     fn next_ident_or_token68(&mut self, first_equal_index: usize) -> usize {
@@ -147,19 +153,19 @@ impl<'a> TokenIter<'a> {
                 }
                 _ => { // beginning of a token or quoted string, go back to the first equal sign
                     self.position = first_equal_index;
-                    return first_equal_index;
+                    return first_equal_index - 1;
                 }
             }
         }
 
-        last_equal_index + 1
+        last_equal_index
     }
 
     fn next_string(&mut self, begin: usize) -> Option<Token<'a>> {
         let begin = begin + 1;
         while let Some((end, ch)) = self.next_char() {
             match ch {
-                b'"' => return Some(Token::String(Cow::Borrowed(self.slice(begin, end)))),
+                b'"' => return Some(Token::Text(Cow::Borrowed(self.slice(begin, end)))),
                 b'\\' => {
                     let mut string = self.slice(begin, end).to_owned();
                     if let Some((_, ch)) = self.next_char() {
@@ -182,7 +188,7 @@ impl<'a> TokenIter<'a> {
     fn next_string_owned(&mut self, mut string: String) -> Option<Token<'a>> {
         while let Some((_, ch)) = self.next_char() {
             match ch {
-                b'"' => return Some(Token::String(Cow::Owned(string))),
+                b'"' => return Some(Token::Text(Cow::Owned(string))),
                 b'\\' => {
                     if let Some((_, ch)) = self.next_char() {
                         string.push(ch as char);
@@ -224,53 +230,60 @@ struct ChallengeIter<'a> {
 impl<'a> ChallengeIter<'a> {
     fn challenge(&mut self) -> Option<::Result<Challenge<'a>>> {
         let mut challenge = match self.tokens.next() {
-            Some(Token::Ident(ident)) => Challenge {
+            Some(Token::Text(ident)) => Challenge {
                 scheme: ident,
-                params: vec![]
+                info: None
             },
             None => return None,
             Some(_) => return Some(Err(::Error::Header))
         };
 
         match self.tokens.next() {
-            None => return Some(Ok(challenge)),
-            Some(Token::Ident(ident)) => {
-                if let Err(e) = self.add_params(&mut challenge.params, ident) {
-                    return Some(Err(e));
+            None => Some(Ok(challenge)),
+            Some(Token::Text(ident)) => {
+                match self.tokens.next() {
+                    None => {
+                        challenge.info = Some(ChallengeInfo::Base64(ident));
+                        return Some(Ok(challenge));
+                    }
+                    Some(Token::Equal) => (),
+                    _ => return Some(Err(::Error::Header))
                 }
-                Some(Ok(challenge))
+
+                match self.tokens.next() {
+                    Some(Token::Text(value)) => {
+                        let mut params = vec![(ident, value)];
+                        if let Err(e) = self.add_params(&mut params) {
+                            return Some(Err(e));
+                        }
+
+                        challenge.info = Some(ChallengeInfo::Params(params));
+                        Some(Ok(challenge))
+                    }
+                    _ => Some(Err(::Error::Header))
+                }
             }
-            _ => return Some(Err(::Error::Header))
+            _ => Some(Err(::Error::Header))
         }
     }
 
-    fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>, ident: &'a str) -> ::Result<()> {
-        let mut state = 1;
-        let mut key = Some(Cow::Borrowed(ident));
+    fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
         while let Some(token) = self.tokens.next() {
-            match token {
-                Token::Equal => {
-                    state = 1;
-                    self.tokens.next().unwrap();
+            let key = match token {
+                Token::Text(ident) => ident,
+                _ => return Err(::Error::Header)
+            };
+
+            match self.tokens.next() {
+                Some(Token::Equal) => (),
+                _ => return Err(::Error::Header)
+            }
+
+            match self.tokens.next() {
+                Some(Token::Text(value)) => {
+                    params.push((key, value));
                 }
-                Token::Ident(ident) => {
-                    if state == 1 {
-                        params.push((key.take().unwrap(), Cow::Borrowed(ident)));
-                        state = 0;
-                    } else {
-                        key = Some(Cow::Borrowed(ident));
-                        state = 1;
-                    }
-                }
-                Token::String(cow) => {
-                    if state == 1 {
-                        params.push((key.take().unwrap(), cow));
-                        state = 0;
-                    } else {
-                        key = Some(cow);
-                        state = 1;
-                    }
-                }
+                _ => return Err(::Error::Header)
             }
         }
 
@@ -310,8 +323,8 @@ pub trait Scheme: fmt::Debug + Clone + Send + Sync {
     /// Format the Scheme data into a header value.
     fn fmt_scheme(&self, &mut fmt::Formatter) -> fmt::Result;
 
-    /// Creates a Scheme from a list of parameters.
-    fn from_params<'a>(params: &[(Cow<'a, str>, Cow<'a, str>)]) -> ::Result<Self>;
+    /// Creates a Scheme from challenge information.
+    fn from_info<'a>(info: Option<&ChallengeInfo<'a>>) -> ::Result<Self>;
 }
 
 /// Credential holder for Basic Authentication
@@ -333,12 +346,41 @@ impl Scheme for Basic {
         f.write_str("Basic")
     }
 
-    fn from_params<'a>(_params: &[(Cow<'a, str>, Cow<'a, str>)]) -> ::Result<Basic> {
-        let basic = Basic {
-            username: "foo".to_string(),
-            password: Some("bar".to_string())
-        };
-        Ok(basic)
+    fn from_info<'a>(info: Option<&ChallengeInfo<'a>>) -> ::Result<Basic> {
+        if let Some(&ChallengeInfo::Base64(ref base64)) = info {
+            println!("base64 info: {:?}", base64);
+            match base64.from_base64() {
+                Ok(decoded) => match String::from_utf8(decoded) {
+                    Ok(text) => {
+                        let mut parts = &mut text.split(':');
+                        let user = match parts.next() {
+                            Some(part) => part.to_owned(),
+                            None => return Err(::Error::Header)
+                        };
+                        let password = match parts.next() {
+                            Some(part) => Some(part.to_owned()),
+                            None => None
+                        };
+                        println!("username: {:?}", user);
+                        println!("password: {:?}", password);
+                        Ok(Basic {
+                            username: user,
+                            password: password
+                        })
+                    },
+                    Err(e) => {
+                        debug!("Basic::from_utf8 error={:?}", e);
+                        Err(::Error::Header)
+                    }
+                },
+                Err(e) => {
+                    debug!("Basic::from_base64 error={:?}", e);
+                    Err(::Error::Header)
+                }
+            }
+        } else {
+            Err(::Error::Header)
+        }
     }
 }
 
@@ -362,14 +404,18 @@ mod tests {
         parse_challenges("Basic x==,Digest").count();
         parse_challenges("Basic x=    ,Digest").count();
         parse_challenges("Basic x==   ,Digest").count();
+        parse_challenges("Basic a=b,   Digest").count();
+        parse_challenges("Basic aa=bb,   Digest").count();
+        parse_challenges("Basic b=\"a\",   Digest").count();
+        parse_challenges("Basic bb=\"aa\",   Digest").count();
         parse_challenges("Basic x=    a  ,   Digest").count();
         parse_challenges(r#"Basic x=    "a \"quoted\" pair",Digest"#).count();
 
-        let a = [b"Basic".to_vec()];
+        let a = [b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==".to_vec()];
         let a: WwwAuthenticate<Basic> = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
         let b = Basic {
-            username: "login".to_string(),
-            password: Some("password".to_string())
+            username: "Aladdin".to_string(),
+            password: Some("open sesame".to_string())
         };
         assert_eq!(*a, b);
     }
