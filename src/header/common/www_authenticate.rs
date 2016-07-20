@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::iter::{Peekable};
+use std::str::Split;
 
 use header::{Header, parsing};
 
@@ -77,7 +78,6 @@ impl<'a> Challenge<'a> {
 enum Token<'a> {
     Ident(&'a str),
     String(Cow<'a, str>),
-    Comma,
     Equal
 }
 
@@ -117,7 +117,7 @@ impl<'a> TokenIter<'a> {
                     end = self.next_ident_or_token68(index);
                     break;
                 }
-                b' ' | b'\t' | b',' | b'"' => {
+                b' ' | b'\t' | b'"' => {
                     end = index;
                     break;
                 }
@@ -144,10 +144,6 @@ impl<'a> TokenIter<'a> {
                 b' ' | b'\t' => {
                     // to know that this is no longer a series of '='
                     whitespace = true;
-                }
-                b',' => { // token68, go back to the comma
-                    self.position = index;
-                    break;
                 }
                 _ => { // beginning of a token or quoted string, go back to the first equal sign
                     self.position = first_equal_index;
@@ -207,20 +203,22 @@ impl<'a> Iterator for TokenIter<'a> {
     type Item = Token<'a>;
     fn next(&mut self) -> Option<Token<'a>> {
         while let Some((index, ch)) = self.next_char() {
-            match ch {
-                b'=' => return Some(Token::Equal),
-                b',' => return Some(Token::Comma),
+            let token = match ch {
                 b' ' | b'\t' => continue,
-                b'"' => return self.next_string(index),
-                _ => return self.next_ident(index)
-            }
+                b'=' => Some(Token::Equal),
+                b'"' => self.next_string(index),
+                _ => self.next_ident(index)
+            };
+            println!("{:?}", token);
+            return token;
         }
         None
     }
 }
 
 struct ChallengeIter<'a> {
-    tokens: Peekable<TokenIter<'a>>
+    tokens: Peekable<TokenIter<'a>>,
+    split: Split<'a, char>
 }
 
 impl<'a> ChallengeIter<'a> {
@@ -235,11 +233,7 @@ impl<'a> ChallengeIter<'a> {
         };
 
         match self.tokens.next() {
-            None | Some(Token::Comma) => {
-                // the comma here is ambiguous
-                // we interpret a ',' to mean the end of this challenge
-                return Some(Ok(challenge))
-            }
+            None => return Some(Ok(challenge)),
             Some(Token::Ident(ident)) => {
                 if let Err(e) = self.add_params(&mut challenge.params, ident) {
                     return Some(Err(e));
@@ -277,9 +271,6 @@ impl<'a> ChallengeIter<'a> {
                         state = 1;
                     }
                 }
-                Token::Comma => {
-                    return Ok(());
-                }
             }
         }
 
@@ -290,17 +281,23 @@ impl<'a> ChallengeIter<'a> {
 impl<'a> Iterator for ChallengeIter<'a> {
     type Item = ::Result<Challenge<'a>>;
     fn next(&mut self) -> Option<Self::Item> {
-        while self.tokens.peek() == Some(&Token::Comma) {
-            self.tokens.next().unwrap();
+        if let Some(entry) = self.split.by_ref().filter_map(|x| match x.trim() {
+            "" => None,
+            y => Some(y)
+        }).next() {
+            println!("entry: \"{}\"", entry);
+            self.tokens = TokenIter::new(entry).peekable();
+            self.challenge()
+        } else {
+            None
         }
-
-        self.challenge()
     }
 }
 
 fn parse_challenges(text: &str) -> ChallengeIter {
     ChallengeIter {
-        tokens: TokenIter::new(text).peekable()
+        tokens: TokenIter::new(text).peekable(),
+        split: text.split(',')
     }
 }
 
@@ -353,40 +350,20 @@ impl fmt::Display for WwwAuthenticate<Basic> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WwwAuthenticate, Basic, TokenIter};
+    use super::{WwwAuthenticate, Basic, parse_challenges};
     use ::header::Header;
 
     #[test]
     fn test_parse_header() {
         // assert!(WwwAuthenticate::parse_header([b"".to_vec()].as_ref()).is_err());
 
-        for token in TokenIter::new("Basic x=,Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new("Basic x=  =,Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new("Basic x==,Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new("Basic x=    ,Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new("Basic x==   ,Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new("Basic x=    a  ,   Digest") {
-            println!("{:?}", token);
-        }
-
-        for token in TokenIter::new(r#"Basic x=    "a \"quoted\" pair",Digest"#) {
-            println!("{:?}", token);
-        }
+        parse_challenges("Basic x=,Digest").count();
+        parse_challenges("Basic x=  =,Digest").count();
+        parse_challenges("Basic x==,Digest").count();
+        parse_challenges("Basic x=    ,Digest").count();
+        parse_challenges("Basic x==   ,Digest").count();
+        parse_challenges("Basic x=    a  ,   Digest").count();
+        parse_challenges(r#"Basic x=    "a \"quoted\" pair",Digest"#).count();
 
         let a = [b"Basic".to_vec()];
         let a: WwwAuthenticate<Basic> = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
