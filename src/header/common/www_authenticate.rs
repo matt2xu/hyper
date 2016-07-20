@@ -111,10 +111,15 @@ impl<'a> TokenIter<'a> {
         }
     }
 
-    fn slice(&mut self, begin: usize, end: usize) -> &'a str {
-        unsafe {self.text.slice_unchecked(begin, end)}
+    /// Returns a borrowed slice of `self.text` with the given range.
+    fn slice(&mut self, begin: usize, end: usize) -> Cow<'a, str> {
+        Cow::Borrowed(unsafe {self.text.slice_unchecked(begin, end)})
     }
 
+    /// Parses a token or token68.
+    ///
+    /// Note: in this function the range of characters is inclusive
+    /// (as opposed to next_string).
     fn next_ident(&mut self, begin: usize) -> Option<Token<'a>> {
         let mut end = begin;
         while let Some((index, ch)) = self.next_char() {
@@ -131,9 +136,13 @@ impl<'a> TokenIter<'a> {
             }
         }
 
-        Some(Token::Text(Cow::Borrowed(self.slice(begin, end + 1))))
+        Some(Token::Text(self.slice(begin, end + 1)))
     }
 
+    /// Returns the position of the last character (inclusive) of this token.
+    ///
+    /// Peeks at characters after the last equal sign to disambiguate between
+    /// token and token68 rules.
     fn next_ident_or_token68(&mut self, first_equal_index: usize) -> usize {
         let mut last_equal_index = first_equal_index;
         let mut whitespace = false;
@@ -161,42 +170,37 @@ impl<'a> TokenIter<'a> {
         last_equal_index
     }
 
+    /// Parses a quoted-string.
+    ///
+    /// Returns a borrowed &str unless the string contains a quoted-pair,
+    /// in which case returns an owned String.
     fn next_string(&mut self, begin: usize) -> Option<Token<'a>> {
         let begin = begin + 1;
-        while let Some((end, ch)) = self.next_char() {
+        let mut owned = None;
+        while let Some((end, mut ch)) = self.next_char() {
             match ch {
-                b'"' => return Some(Token::Text(Cow::Borrowed(self.slice(begin, end)))),
+                b'"' => {
+                    return Some(Token::Text(match owned {
+                        None => self.slice(begin, end),
+                        Some(string) => Cow::Owned(string)
+                    }));
+                }
                 b'\\' => {
-                    let mut string = self.slice(begin, end).to_owned();
-                    if let Some((_, ch)) = self.next_char() {
-                        string.push(ch as char);
+                    if owned.is_none() {
+                        owned = Some(self.slice(begin, end).into_owned());
+                    }
+
+                    if let Some((_, escaped)) = self.next_char() {
+                        ch = escaped;
                     } else {
                         break;
                     }
-
-                    return self.next_string_owned(string);
                 },
                 _ => ()
             }
-        }
 
-        // malformed string
-        None
-    }
-
-    /// owned version of next_string, used when the quoted-string contains a quoted-pair
-    fn next_string_owned(&mut self, mut string: String) -> Option<Token<'a>> {
-        while let Some((_, ch)) = self.next_char() {
-            match ch {
-                b'"' => return Some(Token::Text(Cow::Owned(string))),
-                b'\\' => {
-                    if let Some((_, ch)) = self.next_char() {
-                        string.push(ch as char);
-                    } else {
-                        break;
-                    }
-                }
-                _ => string.push(ch as char)
+            if let Some(ref mut string) = owned {
+                string.push(ch as char);
             }
         }
 
