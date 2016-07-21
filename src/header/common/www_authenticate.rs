@@ -261,59 +261,63 @@ impl<'a> ChallengeIter<'a> {
             },
         };
 
+        Some(match tokens.next() {
+            None => Ok(challenge),
+            Some(Token::Equal) => Err(::Error::Header),
+            Some(Token::Text(ident)) =>
+                self.info(&mut tokens, ident).map(|info| {
+                    challenge.info = Some(info);
+                    challenge
+                })
+        })
+    }
+
+    fn info(&mut self, tokens: &mut TokenIter<'a>, ident: Cow<'a, str>) -> ::Result<ChallengeInfo<'a>> {
         match tokens.next() {
-            None => Some(Ok(challenge)),
-            Some(Token::Equal) => Some(Err(::Error::Header)),
-            Some(Token::Text(ident)) => {
-                match self.info(tokens, ident) {
-                    Err(e) => Some(Err(e)),
-                    Ok(info) => {
-                        challenge.info = Some(info);
-                        Some(Ok(challenge))
+            None => Ok(ChallengeInfo::Base64(ident)),
+            Some(Token::Text(_)) => Err(::Error::Header),
+            Some(Token::Equal) =>
+                if let Some(Token::Text(value)) = tokens.next() {
+                    // extra tokens are a syntax error
+                    if tokens.next().is_some() {
+                        return Err(::Error::Header);
+                    }
+
+                    let mut params = vec![(ident, value)];
+                    self.add_params(&mut params).map(|_| ChallengeInfo::Params(params))
+                } else {
+                    Err(::Error::Header)
+                }
+        }
+    }
+
+    /// Parses auth-params until the beginning of the next challenge.
+    fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
+        while let Some(&entry) = self.iter.peek() {
+            let mut tokens = TokenIter::new(entry);
+            if let Some(Token::Text(key)) = tokens.next() {
+                match tokens.next() {
+                    None | Some(Token::Text(_)) => {
+                        // auth-scheme alone or followed by a token/token68
+                        break;
+                    }
+                    Some(Token::Equal) => {
+                        if let Some(Token::Text(value)) = tokens.next() {
+                            // make sure there are no extra tokens
+                            if tokens.next().is_none() {
+                                params.push((key, value));
+
+                                // advance the iterator and continue parsing
+                                self.iter.next().unwrap();
+                                continue;
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
 
-    fn info(&mut self, mut tokens: TokenIter<'a>, ident: Cow<'a, str>) -> ::Result<ChallengeInfo<'a>> {
-        match tokens.next() {
-            None => return Ok(ChallengeInfo::Base64(ident)),
-            Some(Token::Equal) => (),
-            Some(Token::Text(_)) => return Err(::Error::Header)
-        }
-
-        match tokens.next() {
-            Some(Token::Text(value)) => {
-                let mut params = vec![(ident, value)];
-                if let Err(e) = self.add_params(tokens, &mut params) {
-                    Err(e)
-                } else {
-                    Ok(ChallengeInfo::Params(params))
-                }
-            }
-            _ => Err(::Error::Header)
-        }
-    }
-
-    fn add_params(&mut self, mut tokens: TokenIter<'a>, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
-        while let Some(token) = tokens.next() {
-            let key = match token {
-                Token::Text(ident) => ident,
-                Token::Equal => return Err(::Error::Header)
-            };
-
-            match tokens.next() {
-                Some(Token::Equal) => (),
-                _ => return Err(::Error::Header)
-            }
-
-            match tokens.next() {
-                Some(Token::Text(value)) => {
-                    params.push((key, value));
-                }
-                _ => return Err(::Error::Header)
-            }
+            // fallthrough error
+            return Err(::Error::Header);
         }
 
         Ok(())
