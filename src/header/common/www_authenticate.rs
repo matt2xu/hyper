@@ -6,8 +6,6 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::iter::{Peekable};
-use std::str::Split;
 
 use header::{Header, parsing};
 
@@ -59,6 +57,7 @@ impl<S: Scheme + Any> Header for WwwAuthenticate<S> {
     }
 }
 
+#[derive(Debug)]
 struct Challenge<'a> {
     scheme: Cow<'a, str>,
     info: Option<ChallengeInfo<'a>>
@@ -127,8 +126,9 @@ impl<'a> TokenIter<'a> {
                     end = self.next_ident_or_token68(index);
                     break;
                 }
-                b' ' | b'\t' | b'"' => {
+                b' ' | b'\t' | b'"' | b',' => {
                     end = index - 1;
+                    self.position = index;
                     break;
                 }
                 _ => { end = index; }
@@ -147,6 +147,10 @@ impl<'a> TokenIter<'a> {
         let mut whitespace = false;
         while let Some((index, ch)) = self.next_char() {
             match ch {
+                b',' => { // token68, go back to the comma
+                    self.position = index;
+                    break;
+                }
                 b'=' => {
                     if whitespace {
                         // syntax error, go back and leave
@@ -206,79 +210,51 @@ impl<'a> TokenIter<'a> {
         // malformed string
         None
     }
+
+    /// Advance to the first valid token skipping whitespace and comma,
+    /// returns false if there are no more tokens to be found.
+    fn advance(&mut self) {
+        while let Some((index, ch)) = self.next_char() {
+            match ch {
+                b' ' | b'\t' | b',' => (),
+                _ => {
+                    self.position = index;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for TokenIter<'a> {
     type Item = Token<'a>;
     fn next(&mut self) -> Option<Token<'a>> {
         while let Some((index, ch)) = self.next_char() {
-            let token = match ch {
+            match ch {
                 b' ' | b'\t' => continue,
-                b'=' => Some(Token::Equal),
-                b'"' => self.next_string(index),
-                _ => self.next_ident(index)
-            };
-            println!("{:?}", token);
-            return token;
-        }
-        None
-    }
-}
-
-struct ChallengeIter<'a> {
-    iter: Peekable<Filtered<'a>>
-}
-
-struct Filtered<'a> {
-    iter: Split<'a, char>
-}
-
-impl<'a> Iterator for Filtered<'a> {
-    type Item = &'a str;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        for entry in self.iter.by_ref() {
-            let trimmed = entry.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
+                b',' => break,
+                b'=' => return Some(Token::Equal),
+                b'"' => return self.next_string(index),
+                _ => return self.next_ident(index)
             }
         }
         None
     }
 }
 
+struct ChallengeIter<'a> {
+    tokens: TokenIter<'a>
+}
+
 impl<'a> ChallengeIter<'a> {
-    fn challenge(&mut self, entry: &'a str) -> Option<::Result<Challenge<'a>>> {
-        let mut tokens = TokenIter::new(entry);
-        let mut challenge = match tokens.next() {
-            None => return None,
-            Some(Token::Equal) => return Some(Err(::Error::Header)),
-            Some(Token::Text(ident)) => Challenge {
-                scheme: ident,
-                info: None
-            },
-        };
-
-        Some(match tokens.next() {
-            None => Ok(challenge),
-            Some(Token::Equal) => Err(::Error::Header),
-            Some(Token::Text(ident)) =>
-                self.info(&mut tokens, ident).map(|info| {
-                    challenge.info = Some(info);
-                    challenge
-                })
-        })
-    }
-
-    fn info(&mut self, tokens: &mut TokenIter<'a>, ident: Cow<'a, str>) -> ::Result<ChallengeInfo<'a>> {
-        match tokens.next() {
+    fn info(&mut self, ident: Cow<'a, str>) -> ::Result<ChallengeInfo<'a>> {
+        match self.tokens.next() {
             None => Ok(ChallengeInfo::Base64(ident)),
             Some(Token::Text(_)) => Err(::Error::Header),
             Some(Token::Equal) =>
-                if let Some(Token::Text(value)) = tokens.next() {
+                if let Some(Token::Text(value)) = self.tokens.next() {
                     // extra tokens are a syntax error
-                    if tokens.next().is_some() {
+                    if self.tokens.next().is_some() {
                         return Err(::Error::Header);
                     }
 
@@ -292,54 +268,72 @@ impl<'a> ChallengeIter<'a> {
 
     /// Parses auth-params until the beginning of the next challenge.
     fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
-        while let Some(&entry) = self.iter.peek() {
-            let mut tokens = TokenIter::new(entry);
-            if let Some(Token::Text(key)) = tokens.next() {
-                match tokens.next() {
-                    None | Some(Token::Text(_)) => {
-                        // auth-scheme alone or followed by a token/token68
-                        println!("beginning of new scheme {}", key);
-                        break;
-                    }
-                    Some(Token::Equal) => {
-                        if let Some(Token::Text(value)) = tokens.next() {
-                            // make sure there are no extra tokens
-                            if tokens.next().is_none() {
-                                params.push((key, value));
+        loop {
+            self.tokens.advance();
+            let position = self.tokens.position;
+            match self.tokens.next() {
+                None => {
+                    // done parsing
+                    return Ok(());
+                }
+                Some(Token::Text(key)) => {
+                    match self.tokens.next() {
+                        None | Some(Token::Text(_)) => {
+                            // auth-scheme alone or followed by a token/token68
+                            self.tokens.position = position;
+                            return Ok(());
+                        }
+                        Some(Token::Equal) => {
+                            if let Some(Token::Text(value)) = self.tokens.next() {
+                                // extra tokens are a syntax error
+                                if self.tokens.next().is_some() {
+                                    break;
+                                }
 
-                                // advance the iterator and continue parsing
-                                self.iter.next().unwrap();
-                                continue;
+                                params.push((key, value));
+                            } else {
+                                break;
                             }
                         }
                     }
                 }
+                Some(Token::Equal) => break
             }
-
-            // fallthrough error
-            return Err(::Error::Header);
         }
 
-        println!("params: {:?}", params);
-        Ok(())
+        Err(::Error::Header)
     }
 }
 
 impl<'a> Iterator for ChallengeIter<'a> {
     type Item = ::Result<Challenge<'a>>;
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(entry) = self.iter.next() {
-            println!("entry: \"{}\"", entry);
-            self.challenge(entry)
-        } else {
-            None
-        }
+        self.tokens.advance();
+
+        let mut challenge = match self.tokens.next() {
+            None => return None,
+            Some(Token::Equal) => return Some(Err(::Error::Header)),
+            Some(Token::Text(ident)) => Challenge {
+                scheme: ident,
+                info: None
+            },
+        };
+
+        Some(match self.tokens.next() {
+            None => Ok(challenge),
+            Some(Token::Equal) => Err(::Error::Header),
+            Some(Token::Text(ident)) =>
+                self.info(ident).map(|info| {
+                    challenge.info = Some(info);
+                    challenge
+                })
+        })
     }
 }
 
 fn parse_challenges(text: &str) -> ChallengeIter {
     ChallengeIter {
-        iter: Filtered {iter: text.split(',')}.peekable()
+        tokens: TokenIter::new(text)
     }
 }
 
@@ -403,8 +397,13 @@ mod tests {
     fn test_parse_header() {
         // assert!(WwwAuthenticate::parse_header([b"".to_vec()].as_ref()).is_err());
 
-        parse_challenges("Basic x=,Digest").count();
-        parse_challenges(r#"Digest   realm="http-auth@example.org",qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS", Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#).count();
+        for challenge in parse_challenges("  ,,,  ,   Digest a=b   , ,,  ,c  =  d,Basic zzzzz==   ,   Digest x=y,z=w") {
+            println!("parsed challenge: {:?}", challenge.unwrap());
+        }
+
+        for challenge in parse_challenges(r#"Digest   realm="http-auth@example.org",qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS", Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#) {
+            println!("parsed challenge: {:?}", challenge.unwrap());
+        }
 
         let a = [b"Basic realm=\"WallyWorld\"".to_vec()];
         let a: WwwAuthenticate<Basic> = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
