@@ -227,63 +227,88 @@ impl<'a> Iterator for TokenIter<'a> {
 }
 
 struct ChallengeIter<'a> {
-    tokens: Peekable<TokenIter<'a>>,
-    split: Split<'a, char>
+    iter: Peekable<Filtered<'a>>
+}
+
+struct Filtered<'a> {
+    iter: Split<'a, char>
+}
+
+impl<'a> Iterator for Filtered<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        for entry in self.iter.by_ref() {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+        None
+    }
 }
 
 impl<'a> ChallengeIter<'a> {
-    fn challenge(&mut self) -> Option<::Result<Challenge<'a>>> {
-        let mut challenge = match self.tokens.next() {
+    fn challenge(&mut self, entry: &'a str) -> Option<::Result<Challenge<'a>>> {
+        let mut tokens = TokenIter::new(entry);
+        let mut challenge = match tokens.next() {
+            None => return None,
+            Some(Token::Equal) => return Some(Err(::Error::Header)),
             Some(Token::Text(ident)) => Challenge {
                 scheme: ident,
                 info: None
             },
-            None => return None,
-            Some(_) => return Some(Err(::Error::Header))
         };
 
-        match self.tokens.next() {
+        match tokens.next() {
             None => Some(Ok(challenge)),
+            Some(Token::Equal) => Some(Err(::Error::Header)),
             Some(Token::Text(ident)) => {
-                match self.tokens.next() {
-                    None => {
-                        challenge.info = Some(ChallengeInfo::Base64(ident));
-                        return Some(Ok(challenge));
-                    }
-                    Some(Token::Equal) => (),
-                    _ => return Some(Err(::Error::Header))
-                }
-
-                match self.tokens.next() {
-                    Some(Token::Text(value)) => {
-                        let mut params = vec![(ident, value)];
-                        if let Err(e) = self.add_params(&mut params) {
-                            return Some(Err(e));
-                        }
-
-                        challenge.info = Some(ChallengeInfo::Params(params));
+                match self.info(tokens, ident) {
+                    Err(e) => Some(Err(e)),
+                    Ok(info) => {
+                        challenge.info = Some(info);
                         Some(Ok(challenge))
                     }
-                    _ => Some(Err(::Error::Header))
                 }
             }
-            _ => Some(Err(::Error::Header))
         }
     }
 
-    fn add_params(&mut self, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
-        while let Some(token) = self.tokens.next() {
+    fn info(&mut self, mut tokens: TokenIter<'a>, ident: Cow<'a, str>) -> ::Result<ChallengeInfo<'a>> {
+        match tokens.next() {
+            None => return Ok(ChallengeInfo::Base64(ident)),
+            Some(Token::Equal) => (),
+            Some(Token::Text(_)) => return Err(::Error::Header)
+        }
+
+        match tokens.next() {
+            Some(Token::Text(value)) => {
+                let mut params = vec![(ident, value)];
+                if let Err(e) = self.add_params(tokens, &mut params) {
+                    Err(e)
+                } else {
+                    Ok(ChallengeInfo::Params(params))
+                }
+            }
+            _ => Err(::Error::Header)
+        }
+    }
+
+    fn add_params(&mut self, mut tokens: TokenIter<'a>, params: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> ::Result<()> {
+        while let Some(token) = tokens.next() {
             let key = match token {
                 Token::Text(ident) => ident,
-                _ => return Err(::Error::Header)
+                Token::Equal => return Err(::Error::Header)
             };
 
-            match self.tokens.next() {
+            match tokens.next() {
                 Some(Token::Equal) => (),
                 _ => return Err(::Error::Header)
             }
 
-            match self.tokens.next() {
+            match tokens.next() {
                 Some(Token::Text(value)) => {
                     params.push((key, value));
                 }
@@ -298,13 +323,9 @@ impl<'a> ChallengeIter<'a> {
 impl<'a> Iterator for ChallengeIter<'a> {
     type Item = ::Result<Challenge<'a>>;
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(entry) = self.split.by_ref().filter_map(|x| match x.trim() {
-            "" => None,
-            y => Some(y)
-        }).next() {
+        if let Some(entry) = self.iter.next() {
             println!("entry: \"{}\"", entry);
-            self.tokens = TokenIter::new(entry).peekable();
-            self.challenge()
+            self.challenge(entry)
         } else {
             None
         }
@@ -313,8 +334,7 @@ impl<'a> Iterator for ChallengeIter<'a> {
 
 fn parse_challenges(text: &str) -> ChallengeIter {
     ChallengeIter {
-        tokens: TokenIter::new(text).peekable(),
-        split: text.split(',')
+        iter: Filtered {iter: text.split(',')}.peekable()
     }
 }
 
