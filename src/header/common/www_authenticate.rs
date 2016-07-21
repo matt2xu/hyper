@@ -9,7 +9,6 @@ use std::ops::{Deref, DerefMut};
 use std::iter::{Peekable};
 use std::str::Split;
 
-use serialize::base64::FromBase64;
 use header::{Header, parsing};
 
 /// The `WWW-Authenticate` header field.
@@ -299,6 +298,7 @@ impl<'a> ChallengeIter<'a> {
                 match tokens.next() {
                     None | Some(Token::Text(_)) => {
                         // auth-scheme alone or followed by a token/token68
+                        println!("beginning of new scheme {}", key);
                         break;
                     }
                     Some(Token::Equal) => {
@@ -320,6 +320,7 @@ impl<'a> ChallengeIter<'a> {
             return Err(::Error::Header);
         }
 
+        println!("params: {:?}", params);
         Ok(())
     }
 }
@@ -358,11 +359,8 @@ pub trait Scheme: fmt::Debug + Clone + Send + Sync {
 /// Credential holder for Basic Authentication
 #[derive(Clone, PartialEq, Debug)]
 pub struct Basic {
-    /// The username as a possibly empty string
-    pub username: String,
-    /// The password. `None` if the `:` delimiter character was not
-    /// part of the parsed input.
-    pub password: Option<String>
+    /// The realm as a possibly empty string
+    pub realm: String
 }
 
 impl Scheme for Basic {
@@ -371,40 +369,18 @@ impl Scheme for Basic {
     }
 
     fn fmt_scheme(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("Basic")
+        write!(f, "Basic realm=\"{}\"", self.realm)
     }
 
     fn from_info<'a>(info: Option<&ChallengeInfo<'a>>) -> ::Result<Basic> {
-        if let Some(&ChallengeInfo::Base64(ref base64)) = info {
-            println!("base64 info: {:?}", base64);
-            match base64.from_base64() {
-                Ok(decoded) => match String::from_utf8(decoded) {
-                    Ok(text) => {
-                        let mut parts = &mut text.split(':');
-                        let user = match parts.next() {
-                            Some(part) => part.to_owned(),
-                            None => return Err(::Error::Header)
-                        };
-                        let password = match parts.next() {
-                            Some(part) => Some(part.to_owned()),
-                            None => None
-                        };
-                        println!("username: {:?}", user);
-                        println!("password: {:?}", password);
-                        Ok(Basic {
-                            username: user,
-                            password: password
-                        })
-                    },
-                    Err(e) => {
-                        debug!("Basic::from_utf8 error={:?}", e);
-                        Err(::Error::Header)
-                    }
-                },
-                Err(e) => {
-                    debug!("Basic::from_base64 error={:?}", e);
-                    Err(::Error::Header)
-                }
+        if let Some(&ChallengeInfo::Params(ref params)) = info {
+            println!("basic params: {:?}", params);
+            if let Some(&(_, ref realm)) = params.iter().find(|pair| pair.0 == "realm") {
+                Ok(Basic {
+                    realm: realm.to_string()
+                })
+            } else {
+                Err(::Error::Header)
             }
         } else {
             Err(::Error::Header)
@@ -428,22 +404,12 @@ mod tests {
         // assert!(WwwAuthenticate::parse_header([b"".to_vec()].as_ref()).is_err());
 
         parse_challenges("Basic x=,Digest").count();
-        parse_challenges("Basic x=  =,Digest").count();
-        parse_challenges("Basic x==,Digest").count();
-        parse_challenges("Basic x=    ,Digest").count();
-        parse_challenges("Basic x==   ,Digest").count();
-        parse_challenges("Basic a=b,   Digest").count();
-        parse_challenges("Basic aa=bb,   Digest").count();
-        parse_challenges("Basic b=\"a\",   Digest").count();
-        parse_challenges("Basic bb=\"aa\",   Digest").count();
-        parse_challenges("Basic x=    a  ,   Digest").count();
-        parse_challenges(r#"Basic x=    "a \"quoted\" pair",Digest"#).count();
+        parse_challenges(r#"Digest   realm="http-auth@example.org",qop="auth, auth-int", algorithm=SHA-256, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS", Digest realm="http-auth@example.org", qop="auth, auth-int", algorithm=MD5, nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS""#).count();
 
-        let a = [b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==".to_vec()];
+        let a = [b"Basic realm=\"WallyWorld\"".to_vec()];
         let a: WwwAuthenticate<Basic> = WwwAuthenticate::parse_header(a.as_ref()).unwrap();
         let b = Basic {
-            username: "Aladdin".to_string(),
-            password: Some("open sesame".to_string())
+            realm: "WallyWorld".to_string()
         };
         assert_eq!(*a, b);
     }
